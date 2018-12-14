@@ -44,6 +44,7 @@
 #include <getopt.h>
 #include <arpa/inet.h>
 #include <time.h>
+#include <search.h>
 
 #include "pingpong.h"
 
@@ -52,10 +53,32 @@ enum {
 	PINGPONG_SEND_WRID = 2,
 
 	MAX_QP             = 256,
+	MAX_TX             = 512,
 };
 
 static int page_size;
 static int validate_buf;
+
+struct list_head {
+	void *next;
+	void *prev;
+};
+
+struct pingpong_mpool;
+
+struct mpool_chunk {
+	struct list_head	free_entry;
+	char			*mem;
+	unsigned		idx;
+};
+
+struct pingpong_mpool {
+	struct list_head	free_chunks;
+	struct ibv_mr		*mr;
+	struct mpool_chunk	*chunks;
+	char			*mem;
+	size_t			nr;
+};
 
 struct pingpong_context {
 	struct ibv_context	*context;
@@ -65,12 +88,15 @@ struct pingpong_context {
 	struct ibv_cq		*cq;
 	struct ibv_srq		*srq;
 	struct ibv_qp		*qp[MAX_QP];
-	char			*buf;
+
+	struct pingpong_mpool	mpool;
+
 	int			 size;
 	int			 send_flags;
 	int			 num_qp;
 	int			 rx_depth;
-	int			 pending[MAX_QP];
+	int			 tx_depth;
+	int			 pending[MAX_QP * MAX_TX];
 	struct ibv_port_attr	 portinfo;
 };
 
@@ -80,6 +106,92 @@ struct pingpong_dest {
 	int psn;
 	union ibv_gid gid;
 };
+
+static int pp_create_mem_pool(struct ibv_pd *pd, size_t chunk_sz,
+			      size_t nr, struct pingpong_mpool *pool)
+{
+	unsigned i;
+
+	pool->chunks = calloc(nr, sizeof(*pool->chunks));
+	if (!pool->chunks)
+		return -ENOMEM;
+
+	pool->mem = memalign(page_size, chunk_sz * nr);
+	if (!pool->mem)
+		goto free_chunks;
+
+	memset(pool->mem, 0, chunk_sz * nr);
+
+	pool->mr = ibv_reg_mr(pd, pool->mem, chunk_sz * nr, IBV_ACCESS_LOCAL_WRITE);
+	if (!pool->mr) {
+		fprintf(stderr, "Couldn't register MR\n");
+		goto free_mem;
+	}
+	pool->free_chunks.next = pool->free_chunks.prev = NULL;
+	pool->nr = nr;
+
+	for (i = 0; i < nr; i++) {
+		struct mpool_chunk *chunk = &pool->chunks[i];
+
+		chunk->idx = i;
+		chunk->mem = pool->mem + chunk_sz * i;
+		insque(&chunk->free_entry, &pool->free_chunks);
+	}
+
+	return 0;
+
+free_mem:
+	free(pool->mem);
+free_chunks:
+	free(pool->chunks);
+
+	return -ENOMEM;
+}
+
+static void pp_destroy_mem_pool(struct pingpong_mpool *pool)
+{
+	ibv_dereg_mr(pool->mr);
+	free(pool->mem);
+	free(pool->chunks);
+}
+
+static struct mpool_chunk *pp_get_chunk_mpool(struct pingpong_mpool *pool)
+{
+	struct mpool_chunk *chunk;
+
+	if (!pool->free_chunks.next)
+		return NULL;
+
+	chunk = pool->free_chunks.next;
+	remque(&chunk->free_entry);
+	chunk->free_entry.next = NULL;
+
+	return chunk;
+}
+
+static void pp_put_chunk_mpool(struct pingpong_mpool *pool,
+			       struct mpool_chunk *chunk)
+{
+	insque(&chunk->free_entry, &pool->free_chunks);
+}
+
+static int pp_put_chunk_by_idx_mpool(struct pingpong_mpool *pool, unsigned idx)
+{
+	struct mpool_chunk *chunk;
+
+	if (idx >= pool->nr) {
+		fprintf(stderr, "Invalid chunk index: %d\n", idx);
+		return 1;
+	}
+	chunk = &pool->chunks[idx];
+	if (chunk->free_entry.next) {
+		fprintf(stderr, "Chunk [%d] is free, can't be put\n", idx);
+		return 1;
+	}
+	pp_put_chunk_mpool(pool, chunk);
+
+	return 0;
+}
 
 static int pp_connect_ctx(struct pingpong_context *ctx, int port, enum ibv_mtu mtu,
 			  int sl, const struct pingpong_dest *my_dest,
@@ -347,11 +459,11 @@ out:
 }
 
 static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
-					    int num_qp, int rx_depth, int port,
+					    int num_qp, int rx_depth, int tx_depth, int port,
 					    int use_event)
 {
 	struct pingpong_context *ctx;
-	int i;
+	int i, rc;
 
 	ctx = calloc(1, sizeof *ctx);
 	if (!ctx)
@@ -361,20 +473,13 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 	ctx->send_flags = IBV_SEND_SIGNALED;
 	ctx->num_qp     = num_qp;
 	ctx->rx_depth   = rx_depth;
-
-	ctx->buf = memalign(page_size, size);
-	if (!ctx->buf) {
-		fprintf(stderr, "Couldn't allocate work buf.\n");
-		goto clean_ctx;
-	}
-
-	memset(ctx->buf, 0, size);
+	ctx->tx_depth   = tx_depth;
 
 	ctx->context = ibv_open_device(ib_dev);
 	if (!ctx->context) {
 		fprintf(stderr, "Couldn't get context for %s\n",
 			ibv_get_device_name(ib_dev));
-		goto clean_buffer;
+		goto clean_ctx;
 	}
 
 	if (use_event) {
@@ -392,17 +497,18 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 		goto clean_comp_channel;
 	}
 
-	ctx->mr = ibv_reg_mr(ctx->pd, ctx->buf, size, IBV_ACCESS_LOCAL_WRITE);
-	if (!ctx->mr) {
-		fprintf(stderr, "Couldn't register MR\n");
+	rc = pp_create_mem_pool(ctx->pd, size, rx_depth + tx_depth * num_qp,
+				&ctx->mpool);
+	if (rc) {
+		fprintf(stderr, "Couldn't create mem pool\n");
 		goto clean_pd;
 	}
 
-	ctx->cq = ibv_create_cq(ctx->context, rx_depth + num_qp, NULL,
+	ctx->cq = ibv_create_cq(ctx->context, rx_depth + tx_depth * num_qp, NULL,
 				ctx->channel, 0);
 	if (!ctx->cq) {
 		fprintf(stderr, "Couldn't create CQ\n");
-		goto clean_mr;
+		goto destroy_mpool;
 	}
 
 	{
@@ -427,7 +533,7 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 			.recv_cq = ctx->cq,
 			.srq     = ctx->srq,
 			.cap     = {
-				.max_send_wr  = 1,
+				.max_send_wr  = tx_depth,
 				.max_send_sge = 1,
 			},
 			.qp_type = IBV_QPT_RC
@@ -476,8 +582,8 @@ clean_qps:
 clean_cq:
 	ibv_destroy_cq(ctx->cq);
 
-clean_mr:
-	ibv_dereg_mr(ctx->mr);
+destroy_mpool:
+	pp_destroy_mem_pool(&ctx->mpool);
 
 clean_pd:
 	ibv_dealloc_pd(ctx->pd);
@@ -488,9 +594,6 @@ clean_comp_channel:
 
 clean_device:
 	ibv_close_device(ctx->context);
-
-clean_buffer:
-	free(ctx->buf);
 
 clean_ctx:
 	free(ctx);
@@ -519,10 +622,7 @@ static int pp_close_ctx(struct pingpong_context *ctx, int num_qp)
 		return 1;
 	}
 
-	if (ibv_dereg_mr(ctx->mr)) {
-		fprintf(stderr, "Couldn't deregister MR\n");
-		return 1;
-	}
+	pp_destroy_mem_pool(&ctx->mpool);
 
 	if (ibv_dealloc_pd(ctx->pd)) {
 		fprintf(stderr, "Couldn't deallocate PD\n");
@@ -541,49 +641,84 @@ static int pp_close_ctx(struct pingpong_context *ctx, int num_qp)
 		return 1;
 	}
 
-	free(ctx->buf);
 	free(ctx);
 
 	return 0;
 }
 
+static inline uint64_t to_wr_id(unsigned io_ind, unsigned ch_ind, unsigned type)
+{
+	return ((uint64_t)io_ind << 20) | (ch_ind << 4) | (type & 0xf);
+}
+
+static inline unsigned to_ch_ind(uint64_t wr_id)
+{
+	return (wr_id >> 4)  & 0xffff;
+}
+
+static inline unsigned to_io_ind(uint64_t wr_id)
+{
+	return (wr_id >> 20) & 0xffff;
+}
+
 static int pp_post_recv(struct pingpong_context *ctx, int n)
 {
-	struct ibv_sge list = {
-		.addr	= (uintptr_t) ctx->buf,
-		.length = ctx->size,
-		.lkey	= ctx->mr->lkey
-	};
+	struct ibv_sge list;
 	struct ibv_recv_wr wr = {
-		.wr_id	    = PINGPONG_RECV_WRID,
 		.sg_list    = &list,
 		.num_sge    = 1,
 	};
 	struct ibv_recv_wr *bad_wr;
+	struct mpool_chunk *chunk;
 	int i;
 
-	for (i = 0; i < n; ++i)
+	for (i = 0; i < n; ++i) {
+		chunk = pp_get_chunk_mpool(&ctx->mpool);
+		if (!chunk) {
+			fprintf(stderr, "No free RX chunk\n");
+			break;
+		}
+		wr.wr_id = to_wr_id(0, chunk->idx, PINGPONG_RECV_WRID);
+
+		list = (typeof(list)) {
+			.addr	= (uintptr_t)chunk->mem,
+			.length = ctx->size,
+			.lkey	= ctx->mpool.mr->lkey
+		};
+
 		if (ibv_post_srq_recv(ctx->srq, &wr, &bad_wr))
 			break;
+	}
 
 	return i;
 }
 
-static int pp_post_send(struct pingpong_context *ctx, int qp_index)
+static int pp_post_send(struct pingpong_context *ctx,
+			int qp_index, int io_index)
 {
-	struct ibv_sge list = {
-		.addr	= (uintptr_t) ctx->buf,
-		.length = ctx->size,
-		.lkey	= ctx->mr->lkey
-	};
+	struct ibv_sge list;
 	struct ibv_send_wr wr = {
-		.wr_id	    = PINGPONG_SEND_WRID,
 		.sg_list    = &list,
 		.num_sge    = 1,
-		.opcode     = IBV_WR_SEND,
+		.opcode     = IBV_WR_SEND_WITH_IMM,
 		.send_flags = ctx->send_flags,
 	};
 	struct ibv_send_wr *bad_wr;
+	struct mpool_chunk *chunk;
+
+	chunk = pp_get_chunk_mpool(&ctx->mpool);
+	if (!chunk) {
+		fprintf(stderr, "No free TX chunk\n");
+		return 1;
+	}
+	wr.wr_id = to_wr_id(io_index, chunk->idx, PINGPONG_SEND_WRID);
+	wr.imm_data = htobe32(io_index);
+
+	list = (typeof(list)) {
+		.addr	= (uintptr_t)chunk->mem,
+		.length = ctx->size,
+		.lkey	= ctx->mpool.mr->lkey
+	};
 
 	return ibv_post_send(ctx->qp[qp_index], &wr, &bad_wr);
 }
@@ -637,6 +772,7 @@ int main(int argc, char *argv[])
 	enum ibv_mtu		 mtu = IBV_MTU_1024;
 	unsigned int             num_qp = 16;
 	unsigned int             rx_depth = 500;
+	unsigned int             tx_depth = 1;
 	unsigned int             iters = 1000;
 	int                      use_event = 0;
 	int                      routs;
@@ -661,6 +797,7 @@ int main(int argc, char *argv[])
 			{ .name = "mtu",      .has_arg = 1, .val = 'm' },
 			{ .name = "num-qp",   .has_arg = 1, .val = 'q' },
 			{ .name = "rx-depth", .has_arg = 1, .val = 'r' },
+			{ .name = "tx-depth", .has_arg = 1, .val = 't' },
 			{ .name = "iters",    .has_arg = 1, .val = 'n' },
 			{ .name = "sl",       .has_arg = 1, .val = 'l' },
 			{ .name = "events",   .has_arg = 0, .val = 'e' },
@@ -669,7 +806,7 @@ int main(int argc, char *argv[])
 			{}
 		};
 
-		c = getopt_long(argc, argv, "p:d:i:s:m:q:r:n:l:eg:c:",
+		c = getopt_long(argc, argv, "p:d:i:s:m:q:r:t:n:l:eg:c:",
 				long_options, NULL);
 		if (c == -1)
 			break;
@@ -719,6 +856,10 @@ int main(int argc, char *argv[])
 			rx_depth = strtoul(optarg, NULL, 0);
 			break;
 
+		case 't':
+			tx_depth = strtoul(optarg, NULL, 0);
+			break;
+
 		case 'n':
 			iters = strtoul(optarg, NULL, 0);
 			break;
@@ -752,20 +893,26 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	if (num_qp > rx_depth) {
-		fprintf(stderr, "rx_depth %d is too small for %d QPs -- "
-			"must have at least one receive per QP.\n",
-			rx_depth, num_qp);
-		return 1;
-	}
-
 	if (num_qp >= MAX_QP) {
 		fprintf(stderr, "num_qp %d must be less than %d\n", num_qp,
 			MAX_QP - 1);
 		return 1;
 	}
 
-	num_wc = num_qp + rx_depth;
+	if (tx_depth > MAX_TX) {
+		fprintf(stderr, "tx_depth %d must be not greater than %d\n", tx_depth,
+			MAX_TX);
+		return 1;
+	}
+
+	if (num_qp * tx_depth > rx_depth) {
+		fprintf(stderr, "rx_depth %d is too small for %d QPs and tx_depth %d -- "
+			"must have at least one receive per QP.\n",
+			rx_depth, num_qp, tx_depth);
+		return 1;
+	}
+
+	num_wc = rx_depth + tx_depth * num_qp;
 	wc     = alloca(num_wc * sizeof *wc);
 
 	page_size = sysconf(_SC_PAGESIZE);
@@ -793,7 +940,8 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	ctx = pp_init_ctx(ib_dev, size, num_qp, rx_depth, ib_port, use_event);
+	ctx = pp_init_ctx(ib_dev, size, num_qp, rx_depth, tx_depth,
+			  ib_port, use_event);
 	if (!ctx)
 		return 1;
 
@@ -864,28 +1012,42 @@ int main(int argc, char *argv[])
 									gidx))
 			return 1;
 
+	rcnt = scnt = 0;
+
 	if (servername) {
 		if (validate_buf)
-			for (i = 0; i < size; i += page_size)
-				ctx->buf[i] = i / page_size % sizeof(char);
+			for (i = 0; i < size * (rx_depth + tx_depth * num_qp);
+				 i += page_size)
+				ctx->mpool.mem[i] = i / page_size % sizeof(char);
 
 		for (i = 0; i < num_qp; ++i) {
-			if (pp_post_send(ctx, i)) {
-				fprintf(stderr, "Couldn't post send\n");
-				return 1;
+			int io;
+
+			for (io = 0; io < tx_depth; io++) {
+				++scnt;
+				if (pp_post_send(ctx, i, io)) {
+					fprintf(stderr, "Couldn't post send\n");
+					return 1;
+				}
+				ctx->pending[i * tx_depth + io] =
+					PINGPONG_SEND_WRID | PINGPONG_RECV_WRID;
 			}
-			ctx->pending[i] = PINGPONG_SEND_WRID | PINGPONG_RECV_WRID;
 		}
-	} else
-		for (i = 0; i < num_qp; ++i)
-			ctx->pending[i] = PINGPONG_RECV_WRID;
+	} else {
+		for (i = 0; i < num_qp; ++i) {
+			int io;
+
+			for (io = 0; io < tx_depth; ++io)
+				ctx->pending[i * tx_depth + io] =
+					PINGPONG_RECV_WRID;
+		}
+	}
 
 	if (gettimeofday(&start, NULL)) {
 		perror("gettimeofday");
 		return 1;
 	}
 
-	rcnt = scnt = 0;
 	while (rcnt < iters || scnt < iters) {
 		if (use_event) {
 			struct ibv_cq *ev_cq;
@@ -910,7 +1072,7 @@ int main(int argc, char *argv[])
 		}
 
 		{
-			int ne, qp_ind;
+			int ne, qp_ind, io_ind, ch_ind, ind;
 
 			do {
 				ne = ibv_poll_cq(ctx->cq, num_wc, wc);
@@ -922,9 +1084,9 @@ int main(int argc, char *argv[])
 
 			for (i = 0; i < ne; ++i) {
 				if (wc[i].status != IBV_WC_SUCCESS) {
-					fprintf(stderr, "Failed status %s (%d) for wr_id %d\n",
+					fprintf(stderr, "Failed status %s (%d) for wr_id %lx\n",
 						ibv_wc_status_str(wc[i].status),
-						wc[i].status, (int) wc[i].wr_id);
+						wc[i].status, wc[i].wr_id);
 					return 1;
 				}
 
@@ -935,13 +1097,20 @@ int main(int argc, char *argv[])
 					return 1;
 				}
 
-				switch ((int) wc[i].wr_id) {
+				ch_ind = to_ch_ind(wc[i].wr_id);
+
+				switch (wc[i].wr_id & 0xf) {
 				case PINGPONG_SEND_WRID:
-					++scnt;
+					io_ind = to_io_ind(wc[i].wr_id);
+					pp_put_chunk_by_idx_mpool(&ctx->mpool, ch_ind);
+					if (!servername)
+						++scnt;
 					break;
 
 				case PINGPONG_RECV_WRID:
-					if (--routs <= num_qp) {
+					io_ind = be32toh(wc[i].imm_data);
+					pp_put_chunk_by_idx_mpool(&ctx->mpool, ch_ind);
+					if (--routs <= num_qp * tx_depth) {
 						routs += pp_post_recv(ctx, ctx->rx_depth - routs);
 						if (routs < ctx->rx_depth) {
 							fprintf(stderr,
@@ -955,19 +1124,34 @@ int main(int argc, char *argv[])
 					break;
 
 				default:
-					fprintf(stderr, "Completion for unknown wr_id %d\n",
-						(int) wc[i].wr_id);
+					fprintf(stderr, "Completion for unknown wr_id %lx\n",
+							wc[i].wr_id);
 					return 1;
 				}
 
-				ctx->pending[qp_ind] &= ~(int) wc[i].wr_id;
-				if (scnt < iters && !ctx->pending[qp_ind]) {
-					if (pp_post_send(ctx, qp_ind)) {
+				if (io_ind < 0 || io_ind > tx_depth) {
+					fprintf(stderr, "Got incorrect IO index %d\n",
+						io_ind);
+					return 1;
+				}
+
+				ind = qp_ind * tx_depth + io_ind;
+				if (ind >= sizeof(ctx->pending)/sizeof(ctx->pending[0])) {
+					fprintf(stderr, "Got incorrect index %d\n",
+						ind);
+					return 1;
+				}
+
+				ctx->pending[ind] &= ~(wc[i].wr_id & 0xf);
+				if (scnt < iters && !ctx->pending[ind]) {
+					if (servername)
+						++scnt;
+					if (pp_post_send(ctx, qp_ind, io_ind)) {
 						fprintf(stderr, "Couldn't post send\n");
 						return 1;
 					}
-					ctx->pending[qp_ind] = PINGPONG_RECV_WRID |
-							       PINGPONG_SEND_WRID;
+					ctx->pending[ind] = PINGPONG_RECV_WRID |
+							    PINGPONG_SEND_WRID;
 				}
 
 			}
@@ -984,14 +1168,15 @@ int main(int argc, char *argv[])
 			(end.tv_usec - start.tv_usec);
 		long long bytes = (long long) size * iters * 2;
 
-		printf("%lld bytes in %.2f seconds = %.2f Mbit/sec\n",
-		       bytes, usec / 1000000., bytes * 8. / usec);
+		printf("%lld bytes in %.2f seconds = %.2f MiB/sec\n",
+		       bytes, usec / 1000000., bytes / usec);
 		printf("%d iters in %.2f seconds = %.2f usec/iter\n",
 		       iters, usec / 1000000., usec / iters);
 
 		if ((!servername) && (validate_buf)) {
-			for (i = 0; i < size; i += page_size)
-				if (ctx->buf[i] != i / page_size % sizeof(char))
+			for (i = 0; i < size * (rx_depth + tx_depth * num_qp);
+				 i += page_size)
+				if (ctx->mpool.mem[i] != i / page_size % sizeof(char))
 					printf("invalid data in page %d\n",
 					       i / page_size);
 		}
